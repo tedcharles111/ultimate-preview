@@ -6,7 +6,13 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.use(express.static('public'));
+
+// Global middleware – sets headers for EVERY response
+app.use((req, res, next) => {
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  next();
+});
 
 const sessions = new Map();
 
@@ -18,6 +24,14 @@ setInterval(() => {
     }
   }
 }, 10 * 60 * 1000);
+
+// Test endpoint – to verify headers are set
+app.get('/test-headers', (req, res) => {
+  res.json({
+    'Cross-Origin-Embedder-Policy': res.getHeader('Cross-Origin-Embedder-Policy'),
+    'Cross-Origin-Opener-Policy': res.getHeader('Cross-Origin-Opener-Policy')
+  });
+});
 
 app.post('/api/preview/create', (req, res) => {
   try {
@@ -58,9 +72,16 @@ app.get('/api/preview/:sessionId/errors', (req, res) => {
   res.json({ errors: session?.errors || [] });
 });
 
+// Preview route – defined BEFORE static middleware
 app.get('/preview/:sessionId', (req, res) => {
+  // Headers already set by global middleware, but we set them again for safety
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
   res.sendFile(path.join(__dirname, 'public', 'preview.html'));
 });
+
+// Static files – placed AFTER all routes to prevent interference
+app.use(express.static('public'));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
