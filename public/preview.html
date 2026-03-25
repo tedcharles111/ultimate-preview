@@ -74,7 +74,7 @@
     let startupTimeout;
     let db;
 
-    // IndexedDB helpers
+    // ---------- IndexedDB ----------
     async function openDB() {
       return new Promise((resolve, reject) => {
         const req = indexedDB.open('wc-cache', 1);
@@ -118,35 +118,8 @@
       return Array.from(new Uint8Array(hash)).map(b => b.toString(16).padStart(2, '0')).join('');
     }
 
-    // -------------------- Tar helpers (no stat) --------------------
-    async function readAllFiles(webcontainer, dir = '/') {
-      const files = [];
-      const stack = [dir];
-      while (stack.length) {
-        const current = stack.pop();
-        let entries;
-        try {
-          entries = await webcontainer.fs.readdir(current);
-        } catch (e) {
-          continue;
-        }
-        for (const entry of entries) {
-          const full = `${current === '/' ? '' : current}/${entry}`;
-          try {
-            // Attempt to read as file; if it's a directory, readdir would have listed it but we can't differentiate without stat.
-            // Simpler: we can attempt to read file; if error, assume directory.
-            const content = await webcontainer.fs.readFile(full, 'utf-8');
-            files.push({ path: full.slice(1), content });
-          } catch (e) {
-            // It's a directory – push to stack
-            stack.push(full);
-          }
-        }
-      }
-      return files;
-    }
-
-    async function writeTar(webcontainer, gzipped, targetDir = '/') {
+    // ---------- Tar helpers (no stat) ----------
+    async function extractTar(webcontainer, gzipped) {
       const uint8 = new Uint8Array(gzipped);
       const data = pako.ungzip(uint8, { to: 'string' });
       const lines = data.split('\n');
@@ -159,15 +132,15 @@
         const size = parseInt(sizeStr, 8);
         if (size === 0) { i++; continue; }
         const content = lines.slice(i + 1, i + 1 + Math.ceil(size / 512)).join('\n').slice(0, size);
-        entries.push({ path: targetDir + name, content });
+        entries.push({ path: name, content });
         i += 1 + Math.ceil(size / 512);
       }
-      const concurrency = 100;
+      const concurrency = 50;
       for (let i = 0; i < entries.length; i += concurrency) {
         const chunk = entries.slice(i, i + concurrency);
         await Promise.all(chunk.map(async ({ path, content }) => {
           const dir = path.substring(0, path.lastIndexOf('/'));
-          if (dir && !await webcontainer.fs.exists(dir)) {
+          if (dir && !await webcontainer.fs.exists(dir).catch(() => false)) {
             await webcontainer.fs.mkdir(dir, { recursive: true });
           }
           await webcontainer.fs.writeFile(path, content);
@@ -175,8 +148,31 @@
       }
     }
 
-    async function createTar(webcontainer) {
-      const files = await readAllFiles(webcontainer);
+    async function createTar(webcontainer, root = '/') {
+      // Recursively collect all files without using stat
+      const files = [];
+      const stack = [root];
+      while (stack.length) {
+        const current = stack.pop();
+        let entries;
+        try {
+          entries = await webcontainer.fs.readdir(current);
+        } catch (e) {
+          continue;
+        }
+        for (const entry of entries) {
+          const full = current === '/' ? `/${entry}` : `${current}/${entry}`;
+          // Attempt to read file; if fails, assume directory
+          try {
+            const content = await webcontainer.fs.readFile(full, 'utf-8');
+            files.push({ path: full.slice(1), content });
+          } catch (e) {
+            // Directory – push to stack
+            stack.push(full);
+          }
+        }
+      }
+      // Build tar
       let tar = '';
       for (const f of files) {
         const name = f.path;
@@ -196,46 +192,57 @@
       return gz.buffer;
     }
 
-    // -------------------- Pre‑built template --------------------
+    // ---------- Template creation and caching ----------
     async function ensureBaseTemplate(webcontainer) {
-      const templateKey = 'vite-react-template-v1';
+      const templateKey = 'vite-react-template-v2';
       const cached = await getCached(templateKey);
       if (cached) {
         loadingMessage.innerText = 'Restoring base template...';
-        await writeTar(webcontainer, cached);
+        await extractTar(webcontainer, cached);
         return true;
       }
 
-      loadingMessage.innerText = 'Preparing base template (first time only)...';
-      // Create base files
+      loadingMessage.innerText = 'Creating base template (first time)...';
+      // Write minimal files
       await webcontainer.fs.mkdir('/src', { recursive: true });
       await webcontainer.fs.writeFile('/package.json', JSON.stringify({
         name: "template",
         version: "1.0.0",
         type: "module",
         scripts: { dev: "vite" },
-        dependencies: { react: "^18.2.0", "react-dom": "^18.2.0", vite: "^4.0.0", "@vitejs/plugin-react": "^4.0.0" }
+        dependencies: {
+          "react": "^18.2.0",
+          "react-dom": "^18.2.0",
+          "vite": "^4.0.0",
+          "@vitejs/plugin-react": "^4.0.0"
+        }
       }, null, 2));
-      await webcontainer.fs.writeFile('/index.html', '<!DOCTYPE html><html><head><meta charset="UTF-8"/></head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>');
+      await webcontainer.fs.writeFile('/index.html', `<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"/></head>
+<body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body>
+</html>`);
       await webcontainer.fs.writeFile('/src/main.jsx', `import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
       await webcontainer.fs.writeFile('/src/App.jsx', `export default function App() { return <h1>Hello World</h1>; }`);
-      await webcontainer.fs.writeFile('/vite.config.js', `import { defineConfig } from 'vite'; import react from '@vitejs/plugin-react'; export default defineConfig({ plugins: [react()] });`);
+      await webcontainer.fs.writeFile('/vite.config.js', `import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+export default defineConfig({ plugins: [react()] });`);
 
-      // Install dependencies with pnpm
-      loadingMessage.innerText = 'Installing base dependencies (pnpm)...';
-      const install = await webcontainer.spawn('pnpm', ['install', '--prefer-offline']);
+      // Install dependencies with pnpm (fast)
+      loadingMessage.innerText = 'Installing base dependencies...';
+      const install = await webcontainer.spawn('pnpm', ['install', '--prefer-offline', '--no-audit', '--no-fund']);
       await install.exit;
 
-      // Cache the whole template (including node_modules)
+      // Cache the whole project (including node_modules)
       const tarball = await createTar(webcontainer);
       await setCached(templateKey, tarball);
       return true;
     }
 
-    // -------------------- Report errors --------------------
+    // ---------- Error reporting ----------
     function reportError(type, message, details = {}) {
       console.error(type, message, details);
       errorDiv.style.display = 'block';
@@ -275,6 +282,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
       }
     });
 
+    // ---------- Dev command detection ----------
     function getDevCommand(pkg) {
       const scripts = pkg.scripts || {};
       let cmd = scripts.dev || scripts.start || scripts.serve;
@@ -288,6 +296,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
       return { direct: false, cmd: 'npx', args: ['serve', '--port', '3000'] };
     }
 
+    // ---------- Main boot ----------
     async function boot() {
       try {
         const res = await fetch(`/api/preview/${sessionId}`);
@@ -297,9 +306,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
         const wc = await WebContainer.boot();
         loadingMessage.innerText = 'Setting up environment...';
 
-        // Ensure pnpm is installed (most base images have it, but just in case)
-        const pnpmCheck = await wc.spawn('pnpm', ['--version']).exit.catch(() => 1);
-        if (pnpmCheck !== 0) {
+        // Ensure pnpm is installed
+        const pnpmVersion = await wc.spawn('pnpm', ['--version']).exit.catch(() => 1);
+        if (pnpmVersion !== 0) {
           loadingMessage.innerText = 'Installing pnpm...';
           await wc.spawn('npm', ['install', '-g', 'pnpm']).exit;
         }
@@ -325,14 +334,14 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
         }
         await wc.mount(mountStructure);
 
-        // If user's package.json differs, run pnpm install to sync
+        // If user provided a package.json, sync dependencies
         if (session.files['package.json']) {
           const userPkg = JSON.parse(session.files['package.json']);
           const basePkg = JSON.parse(await wc.fs.readFile('/package.json', 'utf-8'));
           if (JSON.stringify(userPkg.dependencies) !== JSON.stringify(basePkg.dependencies)) {
             loadingMessage.innerText = 'Syncing dependencies...';
             await wc.fs.writeFile('/package.json', JSON.stringify(userPkg, null, 2));
-            const install = await wc.spawn('pnpm', ['install', '--prefer-offline']);
+            const install = await wc.spawn('pnpm', ['install', '--prefer-offline', '--no-audit', '--no-fund']);
             await install.exit;
           }
         }
@@ -356,7 +365,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(<App />);`);
           write(d) { if (d.includes('Error:')) reportError('Runtime Error', d); }
         }));
 
-        startupTimeout = setTimeout(() => reportError('Timeout', 'Server not ready in 1000s'), 1000000);
+        startupTimeout = setTimeout(() => reportError('Timeout', 'Dev server did not start within 300 seconds'), 300000);
         wc.on('server-ready', (port, url) => {
           clearTimeout(startupTimeout);
           loadingDiv.style.display = 'none';
