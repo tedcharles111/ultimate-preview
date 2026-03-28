@@ -55,7 +55,7 @@
   <script type="importmap">
     {
       "imports": {
-        "@webcontainer/api": "https://esm.sh/@webcontainer/api@1.2.4"
+        "@webcontainer/api": "https://esm.sh/@webcontainer/api@1.6.1"
       }
     }
   </script>
@@ -69,16 +69,8 @@
     const errorDiv = document.getElementById('error');
     const sessionId = window.location.pathname.split('/').pop();
 
-    let installTimeout;
     let serverTimeout;
-
-    function log(level, msg, details = {}) {
-      const fullMsg = `[${level}] ${msg}`;
-      console.log(fullMsg, details);
-      // Optionally show in UI for debugging (uncomment if needed)
-      // errorDiv.style.display = 'block';
-      // errorDiv.innerHTML += `<div>${fullMsg}</div>`;
-    }
+    let isServerReady = false;
 
     function reportError(type, message, details = {}) {
       console.error(type, message, details);
@@ -129,35 +121,26 @@
       }
     });
 
-    // Helper: parse package.json and return dev command with host flag if needed
+    // Helper to get the best dev command
     function getDevCommand(packageJson) {
       const scripts = packageJson.scripts || {};
-      let command = scripts.dev || scripts.start || scripts.serve;
-      if (!command) return null;
+      let cmd = scripts.dev || scripts.start || scripts.serve;
+      if (!cmd) return null;
 
-      // Detect the tool name (first word)
-      const firstWord = command.trim().split(/\s+/)[0];
-      const restArgs = command.slice(firstWord.length).trim().split(/\s+/);
+      const firstWord = cmd.trim().split(/\s+/)[0];
+      const restArgs = cmd.slice(firstWord.length).trim().split(/\s+/);
 
-      // Add host flag if it's a known dev server
+      // Add host flag for common dev servers
       let args = [...restArgs];
-      if (firstWord === 'vite' && !args.includes('--host')) {
-        args.push('--host');
-      } else if (firstWord === 'next' && !args.includes('-H')) {
-        args.unshift('dev', '-H', '0.0.0.0'); // next dev -H 0.0.0.0
-      } else if (firstWord === 'react-scripts') {
-        // react-scripts start doesn't support --host, but we can use BROWSER=none and maybe detect port from output
-        // We'll just run as is
-      } else if (firstWord === 'vue-cli-service') {
-        args.push('--host', '0.0.0.0');
-      }
+      if (firstWord === 'vite' && !args.includes('--host')) args.push('--host');
+      if (firstWord === 'next') args = ['dev', '-H', '0.0.0.0', ...args];
+      if (firstWord === 'vue-cli-service') args.push('--host', '0.0.0.0');
 
-      // Try to run directly if it's a binary in node_modules/.bin
-      const direct = ['vite', 'next', 'react-scripts', 'vue-cli-service', 'webpack', 'parcel'];
-      if (direct.includes(firstWord)) {
+      // Run directly if it's a known binary
+      const directTools = ['vite', 'next', 'react-scripts', 'vue-cli-service', 'webpack', 'parcel'];
+      if (directTools.includes(firstWord)) {
         return { direct: true, command: 'npx', args: [firstWord, ...args] };
       } else {
-        // Fallback to npm run
         const scriptName = scripts.dev ? 'dev' : (scripts.start ? 'start' : 'serve');
         return { direct: false, command: 'npm', args: ['run', scriptName] };
       }
@@ -165,16 +148,14 @@
 
     async function boot() {
       try {
-        log('INFO', 'Fetching session data...');
         const sessionRes = await fetch(`/api/preview/${sessionId}`);
         if (!sessionRes.ok) throw new Error('Preview session expired');
         const session = await sessionRes.json();
-        log('INFO', 'Session data received', { filesCount: Object.keys(session.files).length });
 
-        const webcontainer = await WebContainer.boot();
-        log('INFO', 'WebContainer booted');
-
+        // Boot WebContainer with workdirName (as bolt.new does)
+        const webcontainer = await WebContainer.boot({ workdirName: 'project' });
         loadingMessage.innerText = 'Mounting files...';
+
         // Mount files
         const mountStructure = {};
         for (const [filePath, fileContent] of Object.entries(session.files)) {
@@ -191,13 +172,10 @@
           }
         }
         await webcontainer.mount(mountStructure);
-        log('INFO', 'Files mounted');
 
-        // ----- Install dependencies if package.json exists -----
+        // Install dependencies if package.json exists
         if (session.files['package.json']) {
           loadingMessage.innerText = 'Installing dependencies...';
-          log('INFO', 'Starting npm install');
-
           const hasLockfile = session.files['package-lock.json'];
           const installCmd = hasLockfile ? 'ci' : 'install';
           const installArgs = [installCmd, '--prefer-offline', '--no-audit', '--no-fund'];
@@ -207,7 +185,7 @@
           installProcess.output.pipeTo(new WritableStream({
             write(data) {
               const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
-              console.log('npm output:', str);
+              console.log('npm install:', str);
               if (str.includes('error') || str.includes('ERR!')) {
                 installError += str;
                 reportError('Install Error', str);
@@ -215,25 +193,15 @@
             }
           }));
 
-          installTimeout = setTimeout(() => {
-            reportError('Installation Timeout', 'npm install took longer than 1000 seconds');
-            installProcess.kill();
-          }, 1000000);
-
           const installExit = await installProcess.exit;
-          clearTimeout(installTimeout);
-
           if (installExit !== 0) {
-            reportError('Installation Failed', `npm ${installCmd} failed with code ${installExit}. Last errors:\n${installError.slice(-1000)}`);
+            reportError('Installation Failed', `npm ${installCmd} failed. Last errors:\n${installError.slice(-1000)}`);
             return;
           }
-          log('INFO', 'Dependencies installed');
         }
 
-        // ----- Start dev server -----
+        // Start dev server
         loadingMessage.innerText = 'Starting dev server...';
-        log('INFO', 'Preparing dev server');
-
         let startCmd, startArgs;
         if (session.files['package.json']) {
           const pkg = JSON.parse(session.files['package.json']);
@@ -242,76 +210,70 @@
             startCmd = devInfo.command;
             startArgs = devInfo.args;
           } else {
-            // No script – fallback to npx serve
             startCmd = 'npx';
             startArgs = ['serve', '--port', '3000'];
           }
         } else {
-          // Static site
           startCmd = 'npx';
           startArgs = ['serve', '--port', '3000'];
         }
-        log('INFO', `Spawning server: ${startCmd} ${startArgs.join(' ')}`);
 
         const serverProcess = await webcontainer.spawn(startCmd, startArgs);
-        let serverUrl = null;
-        let serverReady = false;
-
-        // Listen for stdout to detect when server is ready
         serverProcess.output.pipeTo(new WritableStream({
           write(data) {
             const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
             console.log('server output:', str);
-            if (serverReady) return;
-            // Try to extract URL or port
-            const urlMatch = str.match(/(https?:\/\/[^\s]+)/i) || str.match(/(http:\/\/localhost:\d+)/i);
+            if (isServerReady) return;
+
+            // Try to detect port from stdout
+            const urlMatch = str.match(/(https?:\/\/[^\s]+)/i);
             if (urlMatch) {
-              serverUrl = urlMatch[1];
-              log('INFO', `Detected server ready: ${serverUrl}`);
-              serverReady = true;
-              clearTimeout(serverTimeout);
-              loadingDiv.style.display = 'none';
-              previewFrame.style.display = 'block';
-              previewFrame.src = serverUrl;
-              injectErrorInterceptor(previewFrame);
-            } else {
-              const portMatch = str.match(/port\s+(\d+)/i);
-              if (portMatch) {
-                const port = portMatch[1];
-                serverUrl = `http://localhost:${port}`;
-                log('INFO', `Detected port ${port}, constructing URL: ${serverUrl}`);
-                serverReady = true;
+              const url = urlMatch[1];
+              if (!isServerReady) {
+                isServerReady = true;
                 clearTimeout(serverTimeout);
                 loadingDiv.style.display = 'none';
                 previewFrame.style.display = 'block';
-                previewFrame.src = serverUrl;
+                previewFrame.src = url;
                 injectErrorInterceptor(previewFrame);
+              }
+            } else {
+              const portMatch = str.match(/port\s+(\d+)/i);
+              if (portMatch) {
+                const url = `http://localhost:${portMatch[1]}`;
+                if (!isServerReady) {
+                  isServerReady = true;
+                  clearTimeout(serverTimeout);
+                  loadingDiv.style.display = 'none';
+                  previewFrame.style.display = 'block';
+                  previewFrame.src = url;
+                  injectErrorInterceptor(previewFrame);
+                }
               }
             }
           }
         }));
 
-        // Also listen for the native server-ready event as a backup
-        webcontainer.on('server-ready', (port, url) => {
-          if (serverReady) return;
-          log('INFO', `WebContainer server-ready event: ${url}`);
-          serverReady = true;
-          clearTimeout(serverTimeout);
-          loadingDiv.style.display = 'none';
-          previewFrame.style.display = 'block';
-          previewFrame.src = url;
-          injectErrorInterceptor(previewFrame);
+        // Use WebContainer's native 'port' event (as bolt.new does)
+        webcontainer.on('port', (port, type, url) => {
+          if (type === 'open' && !isServerReady) {
+            isServerReady = true;
+            clearTimeout(serverTimeout);
+            loadingDiv.style.display = 'none';
+            previewFrame.style.display = 'block';
+            previewFrame.src = url;
+            injectErrorInterceptor(previewFrame);
+          }
         });
 
         serverTimeout = setTimeout(() => {
-          if (!serverReady) {
+          if (!isServerReady) {
             reportError('Timeout', 'Dev server did not start within 1000 seconds');
             serverProcess.kill();
           }
         }, 1000000);
 
       } catch (error) {
-        clearTimeout(installTimeout);
         clearTimeout(serverTimeout);
         reportError('Boot Failed', error.message, { stack: error.stack });
       }
