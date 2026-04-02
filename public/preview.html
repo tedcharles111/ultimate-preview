@@ -121,28 +121,57 @@
       }
     });
 
-    // Helper to get the best dev command
-    function getDevCommand(packageJson) {
+    // Detect package manager from lockfiles
+    function getPackageManager(files) {
+      if (files['pnpm-lock.yaml']) return 'pnpm';
+      if (files['yarn.lock']) return 'yarn';
+      return 'npm';
+    }
+
+    // Get install command based on package manager
+    function getInstallCommand(pm, hasLockfile) {
+      switch (pm) {
+        case 'pnpm':
+          return hasLockfile ? ['pnpm', ['install', '--frozen-lockfile']] : ['pnpm', ['install']];
+        case 'yarn':
+          return hasLockfile ? ['yarn', ['install', '--frozen-lockfile']] : ['yarn', ['install']];
+        default:
+          return hasLockfile ? ['npm', ['ci', '--prefer-offline', '--no-audit', '--no-fund']] : ['npm', ['install', '--prefer-offline', '--no-audit', '--no-fund']];
+      }
+    }
+
+    // Get dev command (supports build + dev for complex apps)
+    async function runDevServer(webcontainer, packageJson, pm) {
       const scripts = packageJson.scripts || {};
-      let cmd = scripts.dev || scripts.start || scripts.serve;
-      if (!cmd) return null;
+      let devCmd = scripts.dev || scripts.start || scripts.serve;
+      let buildCmd = scripts.build;
 
-      const firstWord = cmd.trim().split(/\s+/)[0];
-      const restArgs = cmd.slice(firstWord.length).trim().split(/\s+/);
+      // For complex frameworks (Next, Remix, etc.), run build first if it exists and dev doesn't run it automatically
+      if (buildCmd && (devCmd?.includes('next') || devCmd?.includes('remix') || devCmd?.includes('gatsby') || devCmd?.includes('nuxt'))) {
+        loadingMessage.innerText = 'Building project...';
+        const buildProcess = await webcontainer.spawn(pm, ['run', 'build']);
+        await buildProcess.exit;
+      }
 
-      // Add host flag for common dev servers
+      if (!devCmd) {
+        // Fallback to serving static files if no dev script
+        return { command: 'npx', args: ['serve', '--port', '3000'] };
+      }
+
+      // Detect direct tool
+      const firstWord = devCmd.trim().split(/\s+/)[0];
+      const restArgs = devCmd.slice(firstWord.length).trim().split(/\s+/);
       let args = [...restArgs];
       if (firstWord === 'vite' && !args.includes('--host')) args.push('--host');
       if (firstWord === 'next') args = ['dev', '-H', '0.0.0.0', ...args];
       if (firstWord === 'vue-cli-service') args.push('--host', '0.0.0.0');
 
-      // Run directly if it's a known binary
-      const directTools = ['vite', 'next', 'react-scripts', 'vue-cli-service', 'webpack', 'parcel'];
+      const directTools = ['vite', 'next', 'react-scripts', 'vue-cli-service', 'webpack', 'parcel', 'remix', 'gatsby', 'nuxt'];
       if (directTools.includes(firstWord)) {
-        return { direct: true, command: 'npx', args: [firstWord, ...args] };
+        return { command: 'npx', args: [firstWord, ...args] };
       } else {
         const scriptName = scripts.dev ? 'dev' : (scripts.start ? 'start' : 'serve');
-        return { direct: false, command: 'npm', args: ['run', scriptName] };
+        return { command: pm, args: ['run', scriptName] };
       }
     }
 
@@ -152,7 +181,6 @@
         if (!sessionRes.ok) throw new Error('Preview session expired');
         const session = await sessionRes.json();
 
-        // Boot WebContainer with workdirName (as bolt.new does)
         const webcontainer = await WebContainer.boot({ workdirName: 'project' });
         loadingMessage.innerText = 'Mounting files...';
 
@@ -173,19 +201,24 @@
         }
         await webcontainer.mount(mountStructure);
 
+        // Detect package manager
+        const pm = getPackageManager(session.files);
+        loadingMessage.innerText = `Using ${pm}...`;
+
         // Install dependencies if package.json exists
         if (session.files['package.json']) {
           loadingMessage.innerText = 'Installing dependencies...';
-          const hasLockfile = session.files['package-lock.json'];
-          const installCmd = hasLockfile ? 'ci' : 'install';
-          const installArgs = [installCmd, '--prefer-offline', '--no-audit', '--no-fund'];
-          const installProcess = await webcontainer.spawn('npm', installArgs);
+          const hasLockfile = !!(session.files[`${pm}-lock.yaml`] || session.files['package-lock.json'] || session.files['yarn.lock']);
+          const [cmd, args] = getInstallCommand(pm, hasLockfile);
+          const installProcess = await webcontainer.spawn(cmd, args, {
+            env: { NODE_OPTIONS: '--max-old-space-size=4096' }
+          });
 
           let installError = '';
           installProcess.output.pipeTo(new WritableStream({
             write(data) {
               const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
-              console.log('npm install:', str);
+              console.log('install:', str);
               if (str.includes('error') || str.includes('ERR!')) {
                 installError += str;
                 reportError('Install Error', str);
@@ -195,66 +228,59 @@
 
           const installExit = await installProcess.exit;
           if (installExit !== 0) {
-            reportError('Installation Failed', `npm ${installCmd} failed. Last errors:\n${installError.slice(-1000)}`);
+            reportError('Installation Failed', `${cmd} ${args.join(' ')} failed. Last errors:\n${installError.slice(-1000)}`);
             return;
           }
         }
 
-        // Start dev server
-        loadingMessage.innerText = 'Starting dev server...';
-        let startCmd, startArgs;
+        // Parse package.json if exists
+        let pkg = null;
         if (session.files['package.json']) {
-          const pkg = JSON.parse(session.files['package.json']);
-          const devInfo = getDevCommand(pkg);
-          if (devInfo) {
-            startCmd = devInfo.command;
-            startArgs = devInfo.args;
-          } else {
-            startCmd = 'npx';
-            startArgs = ['serve', '--port', '3000'];
-          }
-        } else {
-          startCmd = 'npx';
-          startArgs = ['serve', '--port', '3000'];
+          pkg = JSON.parse(session.files['package.json']);
         }
 
-        const serverProcess = await webcontainer.spawn(startCmd, startArgs);
+        // Start dev server
+        loadingMessage.innerText = 'Starting dev server...';
+        let { command, args: cmdArgs } = pkg ? await runDevServer(webcontainer, pkg, pm) : { command: 'npx', args: ['serve', '--port', '3000'] };
+
+        const serverProcess = await webcontainer.spawn(command, cmdArgs, {
+          env: { NODE_OPTIONS: '--max-old-space-size=4096' }
+        });
+
         serverProcess.output.pipeTo(new WritableStream({
           write(data) {
             const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
-            console.log('server output:', str);
+            console.log('server:', str);
             if (isServerReady) return;
 
-            // Try to detect port from stdout
-            const urlMatch = str.match(/(https?:\/\/[^\s]+)/i);
-            if (urlMatch) {
-              const url = urlMatch[1];
-              if (!isServerReady) {
+            // Detect ready message (common patterns)
+            const readyPatterns = [
+              /Local:\s+(https?:\/\/[^\s]+)/i,
+              /Network:\s+(https?:\/\/[^\s]+)/i,
+              /➜\s+Local:\s+(https?:\/\/[^\s]+)/i,
+              /Server running at\s+(https?:\/\/[^\s]+)/i,
+              /ready in \d+ms/i,
+              /Compiled successfully/i,
+              /started server on .+, url: (https?:\/\/[^\s]+)/i
+            ];
+            for (const pattern of readyPatterns) {
+              const match = str.match(pattern);
+              if (match) {
+                let url = match[1];
+                if (!url.startsWith('http')) url = `http://localhost:${url}`;
                 isServerReady = true;
                 clearTimeout(serverTimeout);
                 loadingDiv.style.display = 'none';
                 previewFrame.style.display = 'block';
                 previewFrame.src = url;
                 injectErrorInterceptor(previewFrame);
-              }
-            } else {
-              const portMatch = str.match(/port\s+(\d+)/i);
-              if (portMatch) {
-                const url = `http://localhost:${portMatch[1]}`;
-                if (!isServerReady) {
-                  isServerReady = true;
-                  clearTimeout(serverTimeout);
-                  loadingDiv.style.display = 'none';
-                  previewFrame.style.display = 'block';
-                  previewFrame.src = url;
-                  injectErrorInterceptor(previewFrame);
-                }
+                break;
               }
             }
           }
         }));
 
-        // Use WebContainer's native 'port' event (as bolt.new does)
+        // Use WebContainer's port event as primary
         webcontainer.on('port', (port, type, url) => {
           if (type === 'open' && !isServerReady) {
             isServerReady = true;
