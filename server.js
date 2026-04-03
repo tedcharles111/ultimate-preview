@@ -14,6 +14,13 @@ app.use((req, res, next) => {
   next();
 });
 
+// Allow embedding in any iframe (for Multiverse)
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'ALLOWALL');
+  res.setHeader('Content-Security-Policy', "frame-ancestors *");
+  next();
+});
+
 const sessions = new Map();
 
 setInterval(() => {
@@ -29,7 +36,9 @@ setInterval(() => {
 app.get('/test-headers', (req, res) => {
   res.json({
     'Cross-Origin-Embedder-Policy': res.getHeader('Cross-Origin-Embedder-Policy'),
-    'Cross-Origin-Opener-Policy': res.getHeader('Cross-Origin-Opener-Policy')
+    'Cross-Origin-Opener-Policy': res.getHeader('Cross-Origin-Opener-Policy'),
+    'X-Frame-Options': res.getHeader('X-Frame-Options'),
+    'Content-Security-Policy': res.getHeader('Content-Security-Policy')
   });
 });
 
@@ -74,9 +83,11 @@ app.get('/api/preview/:sessionId/errors', (req, res) => {
 
 // Preview route – defined BEFORE static middleware
 app.get('/preview/:sessionId', (req, res) => {
-  // Headers already set by global middleware, but we set them again for safety
+  // Set all required headers (COOP/COEP and frame-ancestors)
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('X-Frame-Options', 'ALLOWALL');
+  res.setHeader('Content-Security-Policy', "frame-ancestors *");
   res.sendFile(path.join(__dirname, 'public', 'preview.html'));
 });
 
