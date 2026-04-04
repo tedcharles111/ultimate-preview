@@ -128,33 +128,26 @@
       return 'npm';
     }
 
-    // Get install command based on package manager
+    // Get install command with speed optimizations
     function getInstallCommand(pm, hasLockfile) {
+      const commonFlags = ['--prefer-offline', '--no-audit', '--no-fund', '--loglevel=error'];
       switch (pm) {
         case 'pnpm':
-          return hasLockfile ? ['pnpm', ['install', '--frozen-lockfile']] : ['pnpm', ['install']];
+          return hasLockfile ? ['pnpm', ['install', '--frozen-lockfile', ...commonFlags]] : ['pnpm', ['install', ...commonFlags]];
         case 'yarn':
-          return hasLockfile ? ['yarn', ['install', '--frozen-lockfile']] : ['yarn', ['install']];
+          return hasLockfile ? ['yarn', ['install', '--frozen-lockfile', '--silent']] : ['yarn', ['install', '--silent']];
         default:
-          return hasLockfile ? ['npm', ['ci', '--prefer-offline', '--no-audit', '--no-fund']] : ['npm', ['install', '--prefer-offline', '--no-audit', '--no-fund']];
+          // For npm, avoid generating lockfile if not present
+          const args = hasLockfile ? ['ci', ...commonFlags] : ['install', '--no-package-lock', ...commonFlags];
+          return ['npm', args];
       }
     }
 
-    // Get dev command (supports build + dev for complex apps)
-    async function runDevServer(webcontainer, packageJson, pm) {
+    // Get dev command (direct execution, no build step)
+    async function getDevCommand(packageJson, pm) {
       const scripts = packageJson.scripts || {};
       let devCmd = scripts.dev || scripts.start || scripts.serve;
-      let buildCmd = scripts.build;
-
-      // For complex frameworks (Next, Remix, etc.), run build first if it exists and dev doesn't run it automatically
-      if (buildCmd && (devCmd?.includes('next') || devCmd?.includes('remix') || devCmd?.includes('gatsby') || devCmd?.includes('nuxt'))) {
-        loadingMessage.innerText = 'Building project...';
-        const buildProcess = await webcontainer.spawn(pm, ['run', 'build']);
-        await buildProcess.exit;
-      }
-
       if (!devCmd) {
-        // Fallback to serving static files if no dev script
         return { command: 'npx', args: ['serve', '--port', '3000'] };
       }
 
@@ -184,7 +177,7 @@
         const webcontainer = await WebContainer.boot({ workdirName: 'project' });
         loadingMessage.innerText = 'Mounting files...';
 
-        // Mount files
+        // Mount files (one atomic operation)
         const mountStructure = {};
         for (const [filePath, fileContent] of Object.entries(session.files)) {
           const parts = filePath.split('/');
@@ -211,7 +204,11 @@
           const hasLockfile = !!(session.files[`${pm}-lock.yaml`] || session.files['package-lock.json'] || session.files['yarn.lock']);
           const [cmd, args] = getInstallCommand(pm, hasLockfile);
           const installProcess = await webcontainer.spawn(cmd, args, {
-            env: { NODE_OPTIONS: '--max-old-space-size=4096' }
+            env: {
+              NODE_OPTIONS: '--max-old-space-size=8192',
+              CI: 'true',
+              NO_COLOR: '1'
+            }
           });
 
           let installError = '';
@@ -239,12 +236,16 @@
           pkg = JSON.parse(session.files['package.json']);
         }
 
-        // Start dev server
+        // Start dev server (no separate build step)
         loadingMessage.innerText = 'Starting dev server...';
-        let { command, args: cmdArgs } = pkg ? await runDevServer(webcontainer, pkg, pm) : { command: 'npx', args: ['serve', '--port', '3000'] };
+        let { command, args: cmdArgs } = pkg ? await getDevCommand(pkg, pm) : { command: 'npx', args: ['serve', '--port', '3000'] };
 
         const serverProcess = await webcontainer.spawn(command, cmdArgs, {
-          env: { NODE_OPTIONS: '--max-old-space-size=4096' }
+          env: {
+            NODE_OPTIONS: '--max-old-space-size=8192',
+            CI: 'true',
+            NO_COLOR: '1'
+          }
         });
 
         serverProcess.output.pipeTo(new WritableStream({
@@ -253,7 +254,7 @@
             console.log('server:', str);
             if (isServerReady) return;
 
-            // Detect ready message (common patterns)
+            // Fast ready detection (common patterns)
             const readyPatterns = [
               /Local:\s+(https?:\/\/[^\s]+)/i,
               /Network:\s+(https?:\/\/[^\s]+)/i,
