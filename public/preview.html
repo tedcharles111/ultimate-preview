@@ -10,6 +10,8 @@
     #error { display: none; color: #d32f2f; background: #ffebee; padding: 20px; position: absolute; top: 0; left: 0; right: 0; z-index: 1000; white-space: pre-wrap; font-family: monospace; max-height: 200px; overflow: auto; }
     #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; }
     #loading svg { display: block; margin: 0 auto 20px; }
+    .fallback { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); text-align: center; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); z-index: 2000; }
+    .fallback button { margin-top: 10px; padding: 8px 16px; background: #0070f3; color: white; border: none; border-radius: 4px; cursor: pointer; }
   </style>
 </head>
 <body>
@@ -72,6 +74,34 @@
     let serverTimeout;
     let isServerReady = false;
 
+    // Check if we are cross-origin isolated
+    const isCrossOriginIsolated = window.crossOriginIsolated;
+
+    // If not isolated and inside an iframe, show fallback UI
+    if (!isCrossOriginIsolated && window.self !== window.top) {
+      loadingDiv.style.display = 'none';
+      const fallbackDiv = document.createElement('div');
+      fallbackDiv.className = 'fallback';
+      fallbackDiv.innerHTML = `
+        <strong>⚠️ Cannot preview inside this iframe</strong><br>
+        The parent website (${document.referrer || 'unknown'}) does not have the required security headers.<br>
+        WebContainers need cross-origin isolation to run.<br>
+        <button id="openNewTab">Open preview in new tab (works)</button>
+      `;
+      document.body.appendChild(fallbackDiv);
+      document.getElementById('openNewTab').addEventListener('click', () => {
+        window.open(window.location.href, '_blank');
+      });
+      // Also report error to backend
+      fetch(`/api/preview/${sessionId}/error`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: 'Embedding Error', message: 'Parent page not cross-origin isolated', timestamp: Date.now() })
+      }).catch(() => {});
+      // Stop execution
+      throw new Error('Parent page not cross-origin isolated');
+    }
+
     function reportError(type, message, details = {}) {
       console.error(type, message, details);
       errorDiv.style.display = 'block';
@@ -121,14 +151,13 @@
       }
     });
 
-    // Detect package manager from lockfiles
+    // Detect package manager
     function getPackageManager(files) {
       if (files['pnpm-lock.yaml']) return 'pnpm';
       if (files['yarn.lock']) return 'yarn';
       return 'npm';
     }
 
-    // Get install command with speed optimizations
     function getInstallCommand(pm, hasLockfile) {
       const commonFlags = ['--prefer-offline', '--no-audit', '--no-fund', '--loglevel=error'];
       switch (pm) {
@@ -137,28 +166,23 @@
         case 'yarn':
           return hasLockfile ? ['yarn', ['install', '--frozen-lockfile', '--silent']] : ['yarn', ['install', '--silent']];
         default:
-          // For npm, avoid generating lockfile if not present
           const args = hasLockfile ? ['ci', ...commonFlags] : ['install', '--no-package-lock', ...commonFlags];
           return ['npm', args];
       }
     }
 
-    // Get dev command (direct execution, no build step)
     async function getDevCommand(packageJson, pm) {
       const scripts = packageJson.scripts || {};
       let devCmd = scripts.dev || scripts.start || scripts.serve;
       if (!devCmd) {
         return { command: 'npx', args: ['serve', '--port', '3000'] };
       }
-
-      // Detect direct tool
       const firstWord = devCmd.trim().split(/\s+/)[0];
       const restArgs = devCmd.slice(firstWord.length).trim().split(/\s+/);
       let args = [...restArgs];
       if (firstWord === 'vite' && !args.includes('--host')) args.push('--host');
       if (firstWord === 'next') args = ['dev', '-H', '0.0.0.0', ...args];
       if (firstWord === 'vue-cli-service') args.push('--host', '0.0.0.0');
-
       const directTools = ['vite', 'next', 'react-scripts', 'vue-cli-service', 'webpack', 'parcel', 'remix', 'gatsby', 'nuxt'];
       if (directTools.includes(firstWord)) {
         return { command: 'npx', args: [firstWord, ...args] };
@@ -177,7 +201,6 @@
         const webcontainer = await WebContainer.boot({ workdirName: 'project' });
         loadingMessage.innerText = 'Mounting files...';
 
-        // Mount files (one atomic operation)
         const mountStructure = {};
         for (const [filePath, fileContent] of Object.entries(session.files)) {
           const parts = filePath.split('/');
@@ -194,11 +217,9 @@
         }
         await webcontainer.mount(mountStructure);
 
-        // Detect package manager
         const pm = getPackageManager(session.files);
         loadingMessage.innerText = `Using ${pm}...`;
 
-        // Install dependencies if package.json exists
         if (session.files['package.json']) {
           loadingMessage.innerText = 'Installing dependencies...';
           const hasLockfile = !!(session.files[`${pm}-lock.yaml`] || session.files['package-lock.json'] || session.files['yarn.lock']);
@@ -210,7 +231,6 @@
               NO_COLOR: '1'
             }
           });
-
           let installError = '';
           installProcess.output.pipeTo(new WritableStream({
             write(data) {
@@ -222,7 +242,6 @@
               }
             }
           }));
-
           const installExit = await installProcess.exit;
           if (installExit !== 0) {
             reportError('Installation Failed', `${cmd} ${args.join(' ')} failed. Last errors:\n${installError.slice(-1000)}`);
@@ -230,13 +249,11 @@
           }
         }
 
-        // Parse package.json if exists
         let pkg = null;
         if (session.files['package.json']) {
           pkg = JSON.parse(session.files['package.json']);
         }
 
-        // Start dev server (no separate build step)
         loadingMessage.innerText = 'Starting dev server...';
         let { command, args: cmdArgs } = pkg ? await getDevCommand(pkg, pm) : { command: 'npx', args: ['serve', '--port', '3000'] };
 
@@ -253,8 +270,6 @@
             const str = typeof data === 'string' ? data : new TextDecoder().decode(data);
             console.log('server:', str);
             if (isServerReady) return;
-
-            // Fast ready detection (common patterns)
             const readyPatterns = [
               /Local:\s+(https?:\/\/[^\s]+)/i,
               /Network:\s+(https?:\/\/[^\s]+)/i,
@@ -281,7 +296,6 @@
           }
         }));
 
-        // Use WebContainer's port event as primary
         webcontainer.on('port', (port, type, url) => {
           if (type === 'open' && !isServerReady) {
             isServerReady = true;
@@ -295,7 +309,7 @@
 
         serverTimeout = setTimeout(() => {
           if (!isServerReady) {
-            reportError('Timeout', 'Dev server did not start within 1000 seconds');
+            reportError('Timeout', 'Dev server did not start within 2000 seconds');
             serverProcess.kill();
           }
         }, 1000000);
