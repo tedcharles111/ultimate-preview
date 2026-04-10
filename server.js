@@ -7,6 +7,11 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
+// Health check endpoint for Render
+app.get('/', (req, res) => {
+  res.status(200).send('OK');
+});
+
 // Global middleware – sets headers for EVERY response
 app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
@@ -95,6 +100,6 @@ app.get('/preview/:sessionId', (req, res) => {
 app.use(express.static('public'));
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Preview engine running on port ${PORT}`);
 });
